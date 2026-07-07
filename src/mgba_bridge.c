@@ -16,14 +16,31 @@
 #include <mgba/core/config.h>
 #include <mgba/gba/core.h>
 #include <mgba/gba/interface.h>
+#include <mgba/internal/gba/gba.h>
+#include <mgba/internal/gba/savedata.h>
 #include <mgba-util/vfs.h>
 #include <mgba-util/audio-buffer.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 /* 防止链接器 --gc-sections 把桥接函数删掉 */
 #define MGBA_BRIDGE __attribute__((visibility("default"), used))
+
+#ifdef __ANDROID__
+#define LOG_TAG "MGBA_BRIDGE"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGI(...) do {} while (0)
+#define LOGW(...) do {} while (0)
+#define LOGE(...) do {} while (0)
+#endif
 
 /* ---- 核心创建/销毁 ---- */
 
@@ -56,6 +73,7 @@ MGBA_BRIDGE void mGBACoreDestroy(struct mCore* core) {
 
 MGBA_BRIDGE bool mGBALoadROMBytes(struct mCore* core, const void* data, size_t size) {
     if (!core || !data || size == 0) return false;
+    LOGI("mGBALoadROMBytes: size=%zu", size);
     /* VFileMemChunk 会复制 ROM 数据到自有缓冲区，Dart 端可以立即释放入参 data。
      * 注意：成功后不能 close vf！GBALoadROM 内部 gba->romVf = vf 持有 VFile 所有权，
      * close 会把 gba->memory.rom 正在使用的内存释放掉。
@@ -64,19 +82,52 @@ MGBA_BRIDGE bool mGBALoadROMBytes(struct mCore* core, const void* data, size_t s
      * 因为 reset 里 GBAVideoAssociateRenderer 需要 gbacore->renderer.outputBuffer 已设置，
      * 否则会用 dummy renderer（无输出）。Dart 端会在 setVideoBuffer 之后调用 reset。*/
     struct VFile* vf = VFileMemChunk(data, size);
-    if (!vf) return false;
+    if (!vf) {
+        LOGE("mGBALoadROMBytes: VFileMemChunk failed");
+        return false;
+    }
     bool ret = core->loadROM(core, vf);
     if (!ret) {
+        LOGE("mGBALoadROMBytes: core->loadROM failed");
         vf->close(vf);
+        return false;
     }
-    return ret;
+
+    /* 打印 ROM 头 0x1A 字节（savedata 类型）和游戏 code */
+    struct GBA* gba = (struct GBA*) core->board;
+    if (gba && gba->memory.rom) {
+        char code[5] = {0};
+        memcpy(code, gba->memory.rom + 0xAC, 4);
+        uint8_t saveType = gba->memory.rom[0x1A];
+        LOGI("mGBALoadROMBytes: romCode='%s' saveType=0x%02X", code, saveType);
+    } else {
+        LOGW("mGBALoadROMBytes: gba->memory.rom is NULL after loadROM");
+    }
+
+    return true;
 }
 
 /* ---- 运行控制（wrap inline） ---- */
 
 MGBA_BRIDGE void mGBACoreRunFrame(struct mCore* core) {
     if (!core) return;
+    /* DEBUG: 关键帧打印 PC+DISPCNT+Flash 状态 */
+    static int debugCount = 0;
     core->runFrame(core);
+    if (debugCount < 3 || debugCount == 30 || debugCount == 60 ||
+        debugCount == 90 || debugCount == 120 || debugCount == 180 || debugCount == 300) {
+        struct GBA* gba = (struct GBA*) core->board;
+        struct ARMCore* cpu = (struct ARMCore*) core->cpu;
+        /* io[0] = DISPCNT, io[3] = VCOUNT */
+        LOGI("runFrame[%d] pc=0x%08X dispcnt=0x%04X ly=0x%02X flashType=%d bank=%p data=%p",
+             debugCount, cpu->gprs[15],
+             gba->memory.io[0],
+             gba->memory.io[3],
+             gba->memory.savedata.type,
+             (void*)gba->memory.savedata.currentBank,
+             (void*)gba->memory.savedata.data);
+    }
+    debugCount++;
 }
 
 MGBA_BRIDGE void mGBACoreRunLoop(struct mCore* core) {
@@ -91,7 +142,19 @@ MGBA_BRIDGE void mGBACoreStep(struct mCore* core) {
 
 MGBA_BRIDGE void mGBACoreReset(struct mCore* core) {
     if (!core) return;
+    struct GBA* gba = (struct GBA*) core->board;
+    LOGI("mGBACoreReset: before type=%d vf=%p data=%p",
+         gba->memory.savedata.type,
+         (void*)gba->memory.savedata.vf,
+         (void*)gba->memory.savedata.data);
     core->reset(core);
+    LOGI("mGBACoreReset: after type=%d vf=%p data=%p realVf=%p cpu=%p dispcnt=0x%04X",
+         gba->memory.savedata.type,
+         (void*)gba->memory.savedata.vf,
+         (void*)gba->memory.savedata.data,
+         (void*)gba->memory.savedata.realVf,
+         (void*)core->cpu,
+         gba->memory.io[0]);
 }
 
 /* ---- 视频（wrap inline） ---- */
@@ -190,12 +253,43 @@ MGBA_BRIDGE bool mGBASaveBatteryToFile(struct mCore* core, const char* path) {
     return true;
 }
 
-/* 电池读档：从指定路径加载 SRAM */
+/* 电池读档：从指定路径加载 SRAM。
+ * 注意：core->loadSave → GBALoadSave → GBASavedataInit 会把 VFile 存入
+ * savedata→vf/realVf，之后 InitFlash 通过 vf→map() 映射存档数据。
+ * 此时 VFile 所有权已转移给 savedata，绝不能 close，否则 savedata→vf
+ * 成为悬垂指针，下次任何操作触发 GBASavedataInitFlash 时调用 vf→size()
+ * 就会访问已销毁的函数表 → pc=0 崩溃。 */
 MGBA_BRIDGE bool mGBALoadBatteryFromFile(struct mCore* core, const char* path) {
     if (!core || !path) return false;
-    struct VFile* vf = VFileOpen(path, O_RDONLY);
-    if (!vf) return false;
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        LOGE("mGBALoadBatteryFromFile: stat failed for %s", path);
+        return false;
+    }
+    LOGI("mGBALoadBatteryFromFile: path=%s size=%lld", path, (long long)st.st_size);
+
+    struct GBA* gba = (struct GBA*) core->board;
+    LOGI("mGBALoadBatteryFromFile: before loadSave type=%d vf=%p data=%p",
+         gba->memory.savedata.type,
+         (void*)gba->memory.savedata.vf,
+         (void*)gba->memory.savedata.data);
+
+    /* 必须用 O_RDWR：GBASavedataInitFlash 内部 vf->map() 需要 PROT_WRITE|MAP_SHARED，
+     * mmap(PROT_WRITE) 对只读 fd 会返回 EACCES → data=NULL → Flash 无法初始化。 */
+    struct VFile* vf = VFileOpen(path, O_RDWR);
+    if (!vf) {
+        LOGE("mGBALoadBatteryFromFile: VFileOpen failed");
+        return false;
+    }
     bool ret = core->loadSave(core, vf);
-    vf->close(vf);
+    /* 不要 vf->close(vf)！loadSave 内部 GBASavedataInit 已将 VFile 存入
+     * savedata→vf，InitFlash 通过它映射数据。VFile 所有权已转移，由
+     * 核心销毁（GBADeinit→GBASavedataDeinit→unmap）时统一清理。 */
+    LOGI("mGBALoadBatteryFromFile: after loadSave ret=%d type=%d vf=%p data=%p realVf=%p",
+         ret, gba->memory.savedata.type,
+         (void*)gba->memory.savedata.vf,
+         (void*)gba->memory.savedata.data,
+         (void*)gba->memory.savedata.realVf);
     return ret;
 }

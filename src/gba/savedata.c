@@ -375,6 +375,17 @@ void GBASavedataInitSRAM512(struct GBASavedata* savedata) {
 }
 
 uint8_t GBASavedataReadFlash(struct GBASavedata* savedata, uint16_t address) {
+	/* 兜底：如果 Flash 未正确初始化（currentBank 为 NULL），重新初始化。
+	 * 这可能在以下场景发生：mGBA 懒检测 bug 导致 savedata.type 被设为 Flash
+	 * 但 GBASavedataInitFlash 从未被调用；或者 GBASavedataDeinit 后 type
+	 * 被还原但未重新 init。无论根因如何，这也算是防御性编程。 */
+	if (!savedata->currentBank) {
+		mLOG(GBA_SAVE, WARN, "ReadFlash: currentBank is NULL, force re-init (type=%d)", savedata->type);
+		GBASavedataInitFlash(savedata);
+		if (!savedata->currentBank) {
+			return 0xFF;
+		}
+	}
 	if (savedata->command == FLASH_COMMAND_ID) {
 		if (savedata->type == GBA_SAVEDATA_FLASH512) {
 			if (address < 2) {

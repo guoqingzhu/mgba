@@ -718,8 +718,13 @@ uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 	case GBA_REGION_SRAM_MIRROR:
 		wait = memory->waitstatesNonseq16[address >> BASE_OFFSET];
 		if (memory->savedata.type == GBA_SAVEDATA_AUTODETECT) {
-			mLOG(GBA_MEM, INFO, "Detected SRAM savegame");
-			GBASavedataInitSRAM(&memory->savedata);
+			if (address == SAVEDATA_FLASH_BASE) {
+				mLOG(GBA_MEM, INFO, "Detected Flash savegame");
+				GBASavedataInitFlash(&memory->savedata);
+			} else if (address != SAVEDATA_FLASH_BASE + 1) {
+				mLOG(GBA_MEM, INFO, "Detected SRAM savegame");
+				GBASavedataInitSRAM(&memory->savedata);
+			}
 		}
 		if (gba->performingDMA == 1) {
 			break;

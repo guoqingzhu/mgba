@@ -273,6 +273,11 @@ if(NOT HAIKU AND NOT MSVC AND NOT PSP2)
 endif()
 list(APPEND OS_LIB ${M_LIBRARY})
 
+if(ANDROID)
+	# Android 系统的 log 库，提供 __android_log_print
+	list(APPEND OS_LIB log)
+endif()
+
 if(APPLE OR CMAKE_C_COMPILER_ID STREQUAL "GNU" AND BUILD_LTO)
 	set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -flto")
 	set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto")
