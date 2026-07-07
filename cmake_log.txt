@@ -1,0 +1,2 @@
+CMake Error: The source directory "C:/Code/mgba/Files/CMake/bin/cmake.exe  -B build-android-x86_64 -S . -DCMAKE_TOOLCHAIN_FILE=C:/Users/zhuguoqing/AppData/Local/Android/Sdk/ndk/28.2.13676358/build/cmake/android.toolchain.cmake -DANDROID_ABI=x86_64 -DANDROID_PLATFORM=android-21 -DCMAKE_BUILD_TYPE=Release -DSKIP_LIBRARY=OFF -DBUILD_LIBRETRO=OFF -DBUILD_SHARED=ON -DBUILD_QT=OFF -DBUILD_SDL=OFF -DM_CORE_GBA=ON  " does not exist.
+Specify --help for usage, or press the help button on the CMake GUI.

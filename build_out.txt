@@ -1,0 +1,53 @@
+-- Could NOT find PkgConfig (missing: PKG_CONFIG_EXECUTABLE) 
+-- Checking for one of the modules 'libzip'
+CMake Warning at src/platform/cmake/FindFeature.cmake:83 (message):
+  Requested module libzip missing for feature USE_LIBZIP.  Feature disabled.
+Call Stack (most recent call first):
+  CMakeLists.txt:516 (find_feature)
+
+
+-- Checking for one of the modules 'epoxy'
+CMake Warning at src/platform/cmake/FindFeature.cmake:83 (message):
+  Requested module epoxy missing for feature USE_EPOXY.  Feature disabled.
+Call Stack (most recent call first):
+  CMakeLists.txt:517 (find_feature)
+
+
+-- Looking for crc32
+-- Looking for crc32 - not found
+-- Build type: Release
+-- Platforms:
+-- 	Game Boy Advance: ON
+-- 	Game Boy: ON
+-- Features:
+-- 	Debuggers: OFF
+-- 	CLI debugger: OFF
+-- 	GDB stub: OFF
+-- 	GIF/Video recording: OFF
+-- 	Screenshot/advanced savestate support: OFF
+-- 	ZIP support: OFF
+-- 	7-Zip support: OFF
+-- 	SQLite3 game database: OFF
+-- 	ELF loading support: OFF
+-- 	Discord Rich Presence support: OFF
+-- 	OpenGL support: OpenGL|ES 2, OpenGL|ES 3
+-- Scripting support: OFF
+-- Frontends:
+-- 	Qt: OFF
+-- 	SDL (): OFF
+-- 	Headless: OFF
+-- 	Python bindings: OFF
+-- 	Examples: OFF
+-- Test tools:
+-- 	Profiling: OFF
+-- 	Test harness: OFF
+-- 	Test suite: OFF
+-- 	Video test suite: OFF
+-- Cores:
+-- 	Libretro core: OFF
+-- Libraries:
+-- 	Static: OFF
+-- 	Shared: ON
+-- Configuring done (0.5s)
+-- Generating done (0.0s)
+-- Build files have been written to: C:/Code/mgba/build-android-x86_64
