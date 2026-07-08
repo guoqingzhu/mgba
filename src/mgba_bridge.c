@@ -18,12 +18,32 @@
 #include <mgba/gba/interface.h>
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/savedata.h>
+#include <mgba/internal/gba/sio.h>
+#include <mgba/internal/gba/io.h>
 #include <mgba-util/vfs.h>
 #include <mgba-util/audio-buffer.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <errno.h>
+
+/* ---- 网络 SIO 驱动所需头文件 ---- */
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#define SHUT_RDWR SD_BOTH
+#define MSG_NOSIGNAL 0
+typedef int ssize_t;
+#else
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#endif
+
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -66,7 +86,10 @@ MGBA_BRIDGE struct mCore* mGBACoreCreate(void) {
 MGBA_BRIDGE void mGBACoreDestroy(struct mCore* core) {
     if (!core) return;
     core->deinit(core);
-    free(core);
+    /* 不调 free(core)：Android Scudo 环境下，core 结构体的堆元数据可能
+     * 在运行时被破坏（根本原因尚未定位），free 会触发 "invalid chunk state"
+     * → SIGABRT。deinit 已清理内部资源（ROM、savedata、渲染器等），
+     * 跳过 free 仅泄漏 core 结构体本身（~几 KB），OS 在进程退出时回收。 */
 }
 
 /* ---- ROM 加载（从内存） ---- */
@@ -210,10 +233,13 @@ MGBA_BRIDGE void mGBACoreClearKeys(struct mCore* core, uint32_t keys) {
 
 /* ---- 存档（基于文件路径的 save/load state 和 battery） ---- */
 
-/* 即时存档：保存整个模拟器状态到指定路径 */
+/* 即时存档：保存整个模拟器状态到指定路径。
+ * 必须用 O_RDWR：mCoreSaveStateNamed 内部 map(MAP_WRITE) 走 mmap
+ * (PROT_READ|PROT_WRITE) 路径，只写 fd 会导致 mmap EACCES → state=NULL
+ * → 序列化到空指针 → 文件全零。 */
 MGBA_BRIDGE bool mGBASaveStateToFile(struct mCore* core, const char* path) {
     if (!core || !path) return false;
-    struct VFile* vf = VFileOpen(path, O_CREAT | O_TRUNC | O_WRONLY);
+    struct VFile* vf = VFileOpen(path, O_CREAT | O_TRUNC | O_RDWR);
     if (!vf) return false;
     bool ret = mCoreSaveStateNamed(core, vf, 0);
     vf->close(vf);
@@ -223,9 +249,69 @@ MGBA_BRIDGE bool mGBASaveStateToFile(struct mCore* core, const char* path) {
 /* 即时读档：从指定路径恢复整个模拟器状态 */
 MGBA_BRIDGE bool mGBALoadStateFromFile(struct mCore* core, const char* path) {
     if (!core || !path) return false;
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        LOGE("mGBALoadStateFromFile: stat failed for %s (errno=%d)", path, errno);
+        return false;
+    }
+    ssize_t expectedSize = core->stateSize(core);
+    LOGI("mGBALoadStateFromFile: fileSize=%lld stateSize=%zd",
+         (long long)st.st_size, expectedSize);
+    if ((long long)st.st_size < expectedSize) {
+        LOGE("mGBALoadStateFromFile: file too small (%lld < %zd)",
+             (long long)st.st_size, expectedSize);
+        return false;
+    }
+
+    /* 读取存档文件头部，诊断反序列化失败原因 */
     struct VFile* vf = VFileOpen(path, O_RDONLY);
-    if (!vf) return false;
+    if (!vf) {
+        LOGE("mGBALoadStateFromFile: VFileOpen failed for %s (errno=%d)", path, errno);
+        return false;
+    }
+    uint8_t header[32];
+    ssize_t n = vf->read(vf, header, sizeof(header));
+    if (n >= 32) {
+        uint32_t versionMagic = (uint32_t)header[0] | ((uint32_t)header[1] << 8) |
+                                ((uint32_t)header[2] << 16) | ((uint32_t)header[3] << 24);
+        uint32_t biosChecksum = (uint32_t)header[4] | ((uint32_t)header[5] << 8) |
+                                ((uint32_t)header[6] << 16) | ((uint32_t)header[7] << 24);
+        uint32_t romCrc32    = (uint32_t)header[8] | ((uint32_t)header[9] << 8) |
+                                ((uint32_t)header[10] << 16) | ((uint32_t)header[11] << 24);
+        /* title[12] at offset 0x10, id[4] at offset 0x1C */
+        char title[13] = {0};
+        memcpy(title, header + 0x10, 12);
+        char id[5] = {0};
+        memcpy(id, header + 0x1C, 4);
+
+        struct GBA* gba = (struct GBA*) core->board;
+        char curCode[5] = {0};
+        if (gba && gba->memory.rom) {
+            memcpy(curCode, gba->memory.rom + 0xAC, 4);
+        }
+        LOGI("mGBALoadStateFromFile: stateHeader magic=0x%08X biosCS=0x%08X romCRC=0x%08X title='%.12s' id='%.4s'",
+             versionMagic, biosChecksum, romCrc32, title, id);
+        LOGI("mGBALoadStateFromFile: cur biosCS=0x%08X romCRC=0x%08X romCode='%s'",
+             gba ? gba->biosChecksum : 0,
+             gba ? gba->romCrc32 : 0,
+             curCode);
+
+        /* 预判会失败的校验 */
+        if (versionMagic < 0x01000000 || versionMagic > 0x0100000B) {
+            LOGW("mGBALoadStateFromFile: versionMagic out of range, load will fail");
+        }
+        if (gba && gba->memory.rom && gba->memory.rom[0xAC] != 0) {
+            if (memcmp(id, gba->memory.rom + 0xAC, 4) != 0) {
+                LOGW("mGBALoadStateFromFile: game ID mismatch! state='%.4s' rom='%.4s'", id, curCode);
+            }
+        }
+    }
+    vf->seek(vf, 0, SEEK_SET); /* 回卷以便 mCoreLoadStateNamed 从头读 */
+
+    LOGI("mGBALoadStateFromFile: calling mCoreLoadStateNamed...");
     bool ret = mCoreLoadStateNamed(core, vf, 0);
+    LOGI("mGBALoadStateFromFile: mCoreLoadStateNamed ret=%d", ret);
     vf->close(vf);
     return ret;
 }
@@ -292,4 +378,474 @@ MGBA_BRIDGE bool mGBALoadBatteryFromFile(struct mCore* core, const char* path) {
          (void*)gba->memory.savedata.data,
          (void*)gba->memory.savedata.realVf);
     return ret;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  网络 SIO 驱动 — GBA 联机
+ *
+ *  架构：每个设备上运行一个 mGBA 核心，附带一个自定义 GBASIODriver。
+ *  start 回调将本地的 SIODATA32 发送给对端 socket；
+ *  finishNormal32 回调从 socket 接收对端数据并返回给 mGBA。
+ *
+ *  两台设备的模拟核心独立运行（各自约 60fps），start 调用大致在
+ *  同一帧内发生，finishNormal32 的阻塞 recv 自然起到同步作用。
+ * ═══════════════════════════════════════════════════════════════════ */
+
+#define NET_SIO_DRIVER_ID 0x4E455457  /* "NETW" */
+#define NET_SIO_PORT 7946
+#define NET_SIO_ACCEPT_TIMEOUT_SEC 15
+#define NET_SIO_RECV_TIMEOUT_SEC 5
+
+struct GBASIONetworkDriver {
+    struct GBASIODriver d;
+    int sockFd;
+};
+
+/* ── vtable 回调 ──────────────────────────────────────────── */
+
+static uint32_t _netSioDriverId(const struct GBASIODriver* driver) {
+    UNUSED(driver);
+    return NET_SIO_DRIVER_ID;
+}
+
+static bool _netSioInit(struct GBASIODriver* driver) {
+    UNUSED(driver);
+    return true;
+}
+
+static void _netSioDeinit(struct GBASIODriver* driver) {
+    struct GBASIONetworkDriver* nd = (struct GBASIONetworkDriver*) driver;
+    if (nd->sockFd >= 0) {
+        LOGI("NET_SIO: deinit, closing socket fd=%d", nd->sockFd);
+        shutdown(nd->sockFd, SHUT_RDWR);
+#ifndef _WIN32
+        close(nd->sockFd);
+#else
+        closesocket(nd->sockFd);
+#endif
+        nd->sockFd = -1;
+    }
+    /* 不 free(nd)：mGBA 的驱动生命周期模式中，驱动结构体由调用者管理，
+     * GBASIOSetDriver 在替换旧驱动或 init 失败时也会调 deinit，此时
+     * 调用者仍持有 nd 指针。结构体仅 ~24 字节，泄漏量可忽略。 */
+}
+
+static void _netSioReset(struct GBASIODriver* driver) {
+    UNUSED(driver);
+    /* 重置时不关闭 socket —— socket 由 deinit 统一管理 */
+}
+
+static bool _netSioLoadState(struct GBASIODriver* driver, const void* state, size_t size) {
+    UNUSED(driver); UNUSED(state); UNUSED(size);
+    return true; /* 不支持 savestate 中的联机状态 */
+}
+
+static void _netSioSaveState(struct GBASIODriver* driver, void** state, size_t* size) {
+    UNUSED(driver);
+    *state = NULL;
+    *size = 0;
+}
+
+static void _netSioSetMode(struct GBASIODriver* driver, enum GBASIOMode mode) {
+    LOGI("NET_SIO: mode set to %d", (int) mode);
+}
+
+static bool _netSioHandlesMode(struct GBASIODriver* driver, enum GBASIOMode mode) {
+    UNUSED(driver);
+    return mode == GBA_SIO_NORMAL_32
+        || mode == GBA_SIO_NORMAL_8
+        || mode == GBA_SIO_MULTI;
+}
+
+static int _netSioConnectedDevices(struct GBASIODriver* driver) {
+    UNUSED(driver);
+    return 1; /* 一个对端设备 */
+}
+
+static int _netSioDeviceId(struct GBASIODriver* driver) {
+    UNUSED(driver);
+    return 0; /* 本设备始终为 master（id=0），让对方作为 slave */
+}
+
+static uint16_t _netSioWriteSIOCNT(struct GBASIODriver* driver, uint16_t value) {
+    LOGI("NET_SIO: SIOCNT <- 0x%04X", value);
+    return value;
+}
+
+static uint16_t _netSioWriteRCNT(struct GBASIODriver* driver, uint16_t value) {
+    LOGI("NET_SIO: RCNT <- 0x%04X", value);
+    return value;
+}
+
+/* ── start：读取本地 SIODATA32，写入对端 socket ───────────── */
+
+static bool _netSioStart(struct GBASIODriver* driver) {
+    struct GBASIONetworkDriver* nd = (struct GBASIONetworkDriver*) driver;
+    struct GBASIO* sio = driver->p;
+
+    /* 从 GBA IO 寄存器读取本地要发送的 32-bit 数据 */
+    uint32_t localData = sio->p->memory.io[GBA_REG(SIODATA32_LO)];
+    localData |= (uint32_t) sio->p->memory.io[GBA_REG(SIODATA32_HI)] << 16;
+
+    LOGI("NET_SIO: start transfer, sending 0x%08X", localData);
+
+    ssize_t sent = send(nd->sockFd, (const char*) &localData, sizeof(localData), MSG_NOSIGNAL);
+    if (sent != sizeof(localData)) {
+        LOGE("NET_SIO: send failed, sent=%zd errno=%d", sent, errno);
+        return false;
+    }
+
+    return true; /* 让 mGBA 自动调度 completion 事件 */
+}
+
+/* ── finishNormal32：从 socket 接收对端 32-bit 数据 ────────── */
+
+static uint32_t _netSioFinishNormal32(struct GBASIODriver* driver) {
+    struct GBASIONetworkDriver* nd = (struct GBASIONetworkDriver*) driver;
+    uint32_t peerData = 0xFFFFFFFF;
+
+    ssize_t n = recv(nd->sockFd, (char*) &peerData, sizeof(peerData), 0);
+    if (n != sizeof(peerData)) {
+        LOGE("NET_SIO: finishNormal32 recv failed, n=%zd errno=%d", n, errno);
+        /* 返回 0xFFFFFFFF 表示连接中断 / 无数据 */
+        return 0xFFFFFFFF;
+    }
+
+    LOGI("NET_SIO: finishNormal32 got 0x%08X", peerData);
+    return peerData;
+}
+
+/* ── finishNormal8 ──────────────────────────────────────────── */
+
+static uint8_t _netSioFinishNormal8(struct GBASIODriver* driver) {
+    struct GBASIONetworkDriver* nd = (struct GBASIONetworkDriver*) driver;
+    uint8_t peerData = 0xFF;
+
+    ssize_t n = recv(nd->sockFd, (char*) &peerData, sizeof(peerData), 0);
+    if (n != sizeof(peerData)) {
+        LOGE("NET_SIO: finishNormal8 recv failed, n=%zd", n);
+    } else {
+        LOGI("NET_SIO: finishNormal8 got 0x%02X", peerData);
+    }
+    return peerData;
+}
+
+/* ── finishMultiplayer ───────────────────────────────────────── */
+
+static void _netSioFinishMultiplayer(struct GBASIODriver* driver, uint16_t data[4]) {
+    struct GBASIONetworkDriver* nd = (struct GBASIONetworkDriver*) driver;
+
+    /* MULTI 模式：4 个 uint16_t 数据 */
+    uint16_t peerData[4];
+    ssize_t expected = sizeof(peerData); /* 8 bytes */
+    ssize_t n = recv(nd->sockFd, (char*) peerData, expected, 0);
+    if (n != expected) {
+        LOGE("NET_SIO: finishMultiplayer recv failed, n=%zd", n);
+        memset(data, 0xFF, sizeof(uint16_t) * 4);
+    } else {
+        memcpy(data, peerData, sizeof(uint16_t) * 4);
+        LOGI("NET_SIO: finishMultiplayer got %04X %04X %04X %04X",
+             data[0], data[1], data[2], data[3]);
+    }
+}
+
+/* ── 辅助：设置 socket 为非阻塞 + 设置收发超时 ──────────────── */
+
+static int _setSocketTimeout(int fd, int timeoutSec) {
+#ifndef _WIN32
+    struct timeval tv;
+    tv.tv_sec = timeoutSec;
+    tv.tv_usec = 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        LOGE("NET_SIO: setsockopt SO_RCVTIMEO failed: %d", errno);
+        return -1;
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+        LOGE("NET_SIO: setsockopt SO_SNDTIMEO failed: %d", errno);
+        return -1;
+    }
+#else
+    DWORD timeout = timeoutSec * 1000;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*) &timeout, sizeof(timeout)) < 0) {
+        LOGE("NET_SIO: setsockopt SO_RCVTIMEO failed: %d", WSAGetLastError());
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+static int _setTcpNoDelay(int fd) {
+    int opt = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
+        LOGW("NET_SIO: setsockopt TCP_NODELAY failed: %d", errno);
+        return -1;
+    }
+    return 0;
+}
+
+/* ── 桥接函数：创建新 socket，连接对端，挂载网络 SIO 驱动 ───── */
+
+MGBA_BRIDGE int mGBALinkHost(struct mCore* core, int port) {
+    if (!core) { LOGE("mGBALinkHost: null core"); return -1; }
+
+    LOGI("mGBALinkHost: listening on port %d", port);
+
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        LOGE("mGBALinkHost: WSAStartup failed");
+        return -1;
+    }
+#endif
+
+    int serverFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverFd < 0) {
+        LOGE("mGBALinkHost: socket() failed, errno=%d", errno);
+        return -1;
+    }
+
+    int opt = 1;
+    setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, (const char*) &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(serverFd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
+        LOGE("mGBALinkHost: bind() failed, errno=%d", errno);
+#ifndef _WIN32
+        close(serverFd);
+#else
+        closesocket(serverFd);
+#endif
+        return -1;
+    }
+
+    if (listen(serverFd, 1) < 0) {
+        LOGE("mGBALinkHost: listen() failed, errno=%d", errno);
+#ifndef _WIN32
+        close(serverFd);
+#else
+        closesocket(serverFd);
+#endif
+        return -1;
+    }
+
+    /* 使用 select 实现 accept 超时 */
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(serverFd, &readfds);
+
+    struct timeval tv;
+    tv.tv_sec = NET_SIO_ACCEPT_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+
+    LOGI("mGBALinkHost: waiting for client (timeout %ds)...", NET_SIO_ACCEPT_TIMEOUT_SEC);
+    int selRet = select(serverFd + 1, &readfds, NULL, NULL, &tv);
+    if (selRet <= 0) {
+        LOGE("mGBALinkHost: accept timeout or select error, ret=%d", selRet);
+#ifndef _WIN32
+        close(serverFd);
+#else
+        closesocket(serverFd);
+#endif
+        return -1;
+    }
+
+    int clientFd = accept(serverFd, NULL, NULL);
+#ifndef _WIN32
+    close(serverFd);
+#else
+    closesocket(serverFd);
+#endif
+
+    if (clientFd < 0) {
+        LOGE("mGBALinkHost: accept() failed, errno=%d", errno);
+        return -1;
+    }
+
+    LOGI("mGBALinkHost: client connected, fd=%d", clientFd);
+
+    /* 设置 TCP_NODELAY：确保小的 SIO 数据包立即发送 */
+    _setTcpNoDelay(clientFd);
+    _setSocketTimeout(clientFd, NET_SIO_RECV_TIMEOUT_SEC);
+
+    /* 分配并挂载网络 SIO 驱动 */
+    struct GBASIONetworkDriver* nd = calloc(1, sizeof(*nd));
+    if (!nd) {
+        LOGE("mGBALinkHost: calloc failed");
+#ifndef _WIN32
+        close(clientFd);
+#else
+        closesocket(clientFd);
+#endif
+        return -1;
+    }
+
+    nd->sockFd = clientFd;
+
+    nd->d.init              = _netSioInit;
+    nd->d.deinit            = _netSioDeinit;
+    nd->d.reset             = _netSioReset;
+    nd->d.driverId          = _netSioDriverId;
+    nd->d.loadState         = _netSioLoadState;
+    nd->d.saveState         = _netSioSaveState;
+    nd->d.setMode           = _netSioSetMode;
+    nd->d.handlesMode       = _netSioHandlesMode;
+    nd->d.deviceId          = _netSioDeviceId;
+    nd->d.connectedDevices  = _netSioConnectedDevices;
+    nd->d.writeSIOCNT       = _netSioWriteSIOCNT;
+    nd->d.writeRCNT         = _netSioWriteRCNT;
+    nd->d.start             = _netSioStart;
+    nd->d.finishMultiplayer = _netSioFinishMultiplayer;
+    nd->d.finishNormal8     = _netSioFinishNormal8;
+    nd->d.finishNormal32    = _netSioFinishNormal32;
+
+    struct GBA* gba = (struct GBA*) core->board;
+    GBASIOSetDriver(&gba->sio, &nd->d);
+    LOGI("mGBALinkHost: network SIO driver attached, fd=%d", clientFd);
+    return 0;
+}
+
+MGBA_BRIDGE int mGBALinkConnect(struct mCore* core, const char* host, int port) {
+    if (!core || !host) { LOGE("mGBALinkConnect: null core or host"); return -1; }
+
+    LOGI("mGBALinkConnect: connecting to %s:%d", host, port);
+
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        LOGE("mGBALinkConnect: WSAStartup failed");
+        return -1;
+    }
+#endif
+
+    int sockFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockFd < 0) {
+        LOGE("mGBALinkConnect: socket() failed, errno=%d", errno);
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+
+    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+        LOGE("mGBALinkConnect: inet_pton failed for '%s'", host);
+#ifndef _WIN32
+        close(sockFd);
+#else
+        closesocket(sockFd);
+#endif
+        return -1;
+    }
+
+    /* 设置连接超时（通过 socket 非阻塞 + select） */
+#ifdef _WIN32
+    u_long mode = 1;
+    ioctlsocket(sockFd, FIONBIO, &mode);
+#else
+    int flags = fcntl(sockFd, F_GETFL, 0);
+    fcntl(sockFd, F_SETFL, flags | O_NONBLOCK);
+#endif
+
+    int connRet = connect(sockFd, (struct sockaddr*) &addr, sizeof(addr));
+
+#ifdef _WIN32
+    if (connRet == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
+        LOGE("mGBALinkConnect: connect() failed: %d", WSAGetLastError());
+        closesocket(sockFd);
+        return -1;
+    }
+#else
+    if (connRet < 0 && errno != EINPROGRESS) {
+        LOGE("mGBALinkConnect: connect() failed, errno=%d", errno);
+        close(sockFd);
+        return -1;
+    }
+#endif
+
+    /* 等待连接完成 */
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(sockFd, &wfds);
+
+    struct timeval tv;
+    tv.tv_sec = NET_SIO_ACCEPT_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+
+    int selRet = select(sockFd + 1, NULL, &wfds, NULL, &tv);
+    if (selRet <= 0) {
+        LOGE("mGBALinkConnect: connect timeout, ret=%d", selRet);
+#ifndef _WIN32
+        close(sockFd);
+#else
+        closesocket(sockFd);
+#endif
+        return -1;
+    }
+
+    /* 恢复阻塞模式 */
+#ifdef _WIN32
+    mode = 0;
+    ioctlsocket(sockFd, FIONBIO, &mode);
+#else
+    fcntl(sockFd, F_SETFL, flags);
+#endif
+
+    /* 检查连接是否真正成功 */
+    int soErr = 0;
+    socklen_t soErrLen = sizeof(soErr);
+    if (getsockopt(sockFd, SOL_SOCKET, SO_ERROR, (char*) &soErr, &soErrLen) < 0 || soErr != 0) {
+        LOGE("mGBALinkConnect: SO_ERROR=%d", soErr);
+#ifndef _WIN32
+        close(sockFd);
+#else
+        closesocket(sockFd);
+#endif
+        return -1;
+    }
+
+    LOGI("mGBALinkConnect: connected to %s:%d, fd=%d", host, port, sockFd);
+
+    _setTcpNoDelay(sockFd);
+    _setSocketTimeout(sockFd, NET_SIO_RECV_TIMEOUT_SEC);
+
+    struct GBASIONetworkDriver* nd = calloc(1, sizeof(*nd));
+    if (!nd) {
+        LOGE("mGBALinkConnect: calloc failed");
+#ifndef _WIN32
+        close(sockFd);
+#else
+        closesocket(sockFd);
+#endif
+        return -1;
+    }
+
+    nd->sockFd = sockFd;
+
+    nd->d.init              = _netSioInit;
+    nd->d.deinit            = _netSioDeinit;
+    nd->d.reset             = _netSioReset;
+    nd->d.driverId          = _netSioDriverId;
+    nd->d.loadState         = _netSioLoadState;
+    nd->d.saveState         = _netSioSaveState;
+    nd->d.setMode           = _netSioSetMode;
+    nd->d.handlesMode       = _netSioHandlesMode;
+    nd->d.deviceId          = _netSioDeviceId;
+    nd->d.connectedDevices  = _netSioConnectedDevices;
+    nd->d.writeSIOCNT       = _netSioWriteSIOCNT;
+    nd->d.writeRCNT         = _netSioWriteRCNT;
+    nd->d.start             = _netSioStart;
+    nd->d.finishMultiplayer = _netSioFinishMultiplayer;
+    nd->d.finishNormal8     = _netSioFinishNormal8;
+    nd->d.finishNormal32    = _netSioFinishNormal32;
+
+    struct GBA* gba = (struct GBA*) core->board;
+    GBASIOSetDriver(&gba->sio, &nd->d);
+    LOGI("mGBALinkConnect: network SIO driver attached, fd=%d", sockFd);
+    return 0;
 }
